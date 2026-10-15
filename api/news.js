@@ -1,24 +1,116 @@
+
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST for news search.' });
-  const keyword = String(req.body?.keyword || '').trim().slice(0, 120);
-  if (!keyword) return res.status(400).json({ error: 'Enter a keyword or topic.' });
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'News search is not configured yet. Add GEMINI_API_KEY in Vercel Environment Variables and redeploy.' });
-  const prompt = `Search the web for credible news about "${keyword}" published within the LAST SEVEN DAYS relative to today. Use Google Search grounding. Return a concise neutral news brief, clearly distinguish confirmed reporting from allegations, and do not invent dates, details, or sources. Prefer recent reporting from reputable publishers. For each distinct news report, provide title, publisher, publication date if the search result actually gives it, a short factual snippet, and the original URL. Exclude results outside the last seven days where the date is known. If publication dates cannot be confirmed, explicitly say so and do not pretend they are verified. Mention that an AI summary is not a fact-check.`;
-  try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], tools: [{ google_search: {} }], generationConfig: { temperature: 0.2, maxOutputTokens: 2500 } })
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      error: "Use POST for news search."
     });
-    const data = await response.json();
-    if (!response.ok) return res.status(response.status).json({ error: data?.error?.message || 'Gemini request failed.' });
-    const candidate = data.candidates?.[0];
-    const summary = (candidate?.content?.parts || []).map(p => p.text || '').join('\n').trim();
-    const chunks = candidate?.groundingMetadata?.groundingChunks || [];
+  }
+
+  const keyword = String(req.body?.keyword || "")
+    .trim()
+    .slice(0, 120);
+
+  if (!keyword) {
+    return res.status(400).json({
+      error: "Enter a keyword or topic."
+    });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return res.status(500).json({
+      error: "GEMINI_API_KEY is missing from Vercel."
+    });
+  }
+
+  const prompt = `Search the web for credible news about "${keyword}"
+published within the last seven days. Use Google Search grounding.
+Summarize the findings neutrally. Distinguish confirmed reporting
+from allegations. Do not invent facts, dates, or sources.
+Include original source links when available. Explain that an AI
+summary is not a definitive fact-check.`;
+
+  try {
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/interactions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey
+        },
+        body: JSON.stringify({
+          model: "gemini-3.8-flash",
+          input: prompt,
+          tools: [{ type: "google_search" }],
+          store: false
+        })
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error:
+          data?.error?.message ||
+          data?.message ||
+          "Gemini API request failed."
+      });
+    }
+
+    const summary = String(data.output_text || "").trim();
+    const articles = [];
     const seen = new Set();
-    const articles = chunks.map(chunk => chunk.web).filter(web => web?.uri && /^https?:\/\//i.test(web.uri)).filter(web => { if (seen.has(web.uri)) return false; seen.add(web.uri); return true; }).slice(0, 10).map((web, i) => ({ id: web.uri, title: web.title || `Search result ${i + 1}`, source: web.title || 'Google Search result', url: web.uri, snippet: 'Open the original source to review its report and publication date.', publishedAt: null }));
-    return res.status(200).json({ keyword, summary: summary || 'Gemini returned no summary. Try a more specific keyword.', articles, searchedAt: new Date().toISOString(), windowDays: 7, grounded: Boolean(candidate?.groundingMetadata) });
+
+    for (const step of data.steps || []) {
+      if (step.type !== "model_output") continue;
+
+      for (const block of step.content || []) {
+        if (block.type !== "text") continue;
+
+        for (const annotation of block.annotations || []) {
+          const url = annotation.url || annotation.uri;
+
+          if (
+            !url ||
+            !/^https?:\/\//i.test(url) ||
+            seen.has(url)
+          ) continue;
+
+          seen.add(url);
+
+          articles.push({
+            id: url,
+            title: annotation.title || `Source ${articles.length + 1}`,
+            source: annotation.title || "Google Search source",
+            url,
+            snippet: "Open the original source to review the report.",
+            publishedAt: null
+          });
+
+          if (articles.length >= 10) break;
+        }
+
+        if (articles.length >= 10) break;
+      }
+
+      if (articles.length >= 10) break;
+    }
+
+    return res.status(200).json({
+      keyword,
+      summary: summary ||
+        "Gemini returned no summary. Try another keyword.",
+      articles,
+      searchedAt: new Date().toISOString(),
+      windowDays: 7,
+      grounded: true
+    });
   } catch (error) {
-    return res.status(502).json({ error: 'Could not reach Gemini. Check the deployment logs and try again.' });
+    return res.status(502).json({
+      error: "Could not reach Gemini. Check Vercel function logs."
+    });
   }
 }
